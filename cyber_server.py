@@ -34,17 +34,9 @@ class Server:
             DB_CONFIG["database"]
         )
 
-        create_all_tables(
-            self.db
-        )
-
-        populate_media_menu(
-            self.db
-        )
-
-        fix_old_paths(
-            self.db
-        )
+        create_all_tables(self.db)
+        populate_media_menu(self.db)
+        fix_old_paths(self.db)
 
         self.db.execute(
             "UPDATE clients SET is_online = 0"
@@ -59,6 +51,11 @@ class Server:
         self.online_list = None
         self.all_list = None
 
+        self.online_count_label = None
+        self.registered_count_label = None
+        self.sent_count_label = None
+        self.decoded_count_label = None
+
     def get_hash(self, text):
         return hashlib.sha256(
             text.encode("utf-8")
@@ -67,20 +64,17 @@ class Server:
     def register_user(self, sock):
         username = self.encryptor.receive_encrypted_message(
             sock
-        )
+        ).strip()
 
         password = self.encryptor.receive_encrypted_message(
             sock
         )
-
-        username = username.strip()
 
         if len(username) < 3:
             self.encryptor.send_encrypted_message(
                 sock,
                 "Username is too short"
             )
-
             return
 
         if len(password) < 4:
@@ -88,7 +82,6 @@ class Server:
                 sock,
                 "Password is too short"
             )
-
             return
 
         username_hash = self.get_hash(
@@ -110,7 +103,6 @@ class Server:
                 sock,
                 "User already exists"
             )
-
             return
 
         self.db.insert_row(
@@ -130,9 +122,10 @@ class Server:
         )
 
         self.write_log(
-            "Registered: "
-            + username
+            "Registered: " + username
         )
+
+        self.refresh_lists()
 
     def login_user(self, sock):
         username = self.encryptor.receive_encrypted_message(
@@ -162,7 +155,6 @@ class Server:
                 sock,
                 "User does not exist"
             )
-
             return None
 
         user = users[0]
@@ -172,7 +164,6 @@ class Server:
                 sock,
                 "Wrong password"
             )
-
             return None
 
         self.encryptor.send_encrypted_message(
@@ -185,12 +176,7 @@ class Server:
             user[1]
         )
 
-    def connect_client(
-        self,
-        client_id,
-        username,
-        address
-    ):
+    def connect_client(self, client_id, username, address):
         rows = self.db.get_rows_with_value(
             "clients",
             "client_id",
@@ -234,11 +220,7 @@ class Server:
                 )
             )
 
-    def add_stat(
-        self,
-        client_id,
-        column
-    ):
+    def add_stat(self, client_id, column):
         rows = self.db.get_rows_with_value(
             "clients",
             "client_id",
@@ -252,7 +234,6 @@ class Server:
 
         if column == "total_sent_media":
             current = row[7]
-
         else:
             current = row[8]
 
@@ -264,11 +245,7 @@ class Server:
             [current + 1]
         )
 
-    def handle_client(
-        self,
-        sock,
-        address
-    ):
+    def handle_client(self, sock, address):
         client_id = None
         username = None
 
@@ -278,18 +255,13 @@ class Server:
             )
 
             if action == "REGISTER":
-                self.register_user(
-                    sock
-                )
-
+                self.register_user(sock)
                 return
 
             if action != "LOGIN":
                 return
 
-            login_result = self.login_user(
-                sock
-            )
+            login_result = self.login_user(sock)
 
             if not login_result:
                 return
@@ -304,8 +276,7 @@ class Server:
             )
 
             self.write_log(
-                username
-                + " connected"
+                username + " connected"
             )
 
             self.refresh_lists()
@@ -357,10 +328,21 @@ class Server:
                 elif choice == "3":
                     break
 
+                else:
+                    self.encryptor.send_encrypted_message(
+                        sock,
+                        "Invalid option"
+                    )
+
+        except ConnectionError:
+            if username:
+                self.write_log(
+                    username + " disconnected"
+                )
+
         except Exception as error:
             self.write_log(
-                "Error: "
-                + str(error)
+                "Error: " + str(error)
             )
 
         finally:
@@ -381,10 +363,75 @@ class Server:
 
                 self.refresh_lists()
 
-            sock.close()
+            try:
+                sock.close()
+            except:
+                pass
+
+    def get_all_statistics(self):
+        users = self.db.get_all_rows(
+            "users"
+        )
+
+        data = []
+
+        total_users = 0
+        total_online = 0
+        total_sent = 0
+        total_decoded = 0
+
+        for user in users:
+            total_users += 1
+
+            username_hash = user[0]
+            username = user[1]
+
+            clients = self.db.get_rows_with_value(
+                "clients",
+                "client_id",
+                username_hash
+            )
+
+            if clients:
+                client = clients[0]
+
+                sent = client[7]
+                decoded = client[8]
+                online = client[6]
+                last_seen = client[4]
+
+                if online:
+                    total_online += 1
+
+            else:
+                sent = 0
+                decoded = 0
+                online = False
+                last_seen = None
+
+            total_sent += sent
+            total_decoded += decoded
+
+            data.append(
+                {
+                    "username": username,
+                    "sent": sent,
+                    "decoded": decoded,
+                    "online": online,
+                    "last_seen": last_seen
+                }
+            )
+
+        return (
+            data,
+            total_users,
+            total_online,
+            total_sent,
+            total_decoded
+        )
 
     def refresh_lists(self):
-        if not self.online_list:
+        if not self.online_list or not self.all_list:
             return
 
         def refresh():
@@ -398,17 +445,21 @@ class Server:
                 tk.END
             )
 
-            clients = self.db.get_all_rows(
-                "clients"
-            )
+            (
+                users_data,
+                total_users,
+                total_online,
+                total_sent,
+                total_decoded
+            ) = self.get_all_statistics()
 
-            for client in clients:
+            for item in users_data:
                 text = (
-                    client[1]
+                    item["username"]
                     + " | sent: "
-                    + str(client[7])
+                    + str(item["sent"])
                     + " | decoded: "
-                    + str(client[8])
+                    + str(item["decoded"])
                 )
 
                 self.all_list.insert(
@@ -416,11 +467,27 @@ class Server:
                     text
                 )
 
-                if client[6]:
+                if item["online"]:
                     self.online_list.insert(
                         tk.END,
                         text
                     )
+
+            self.online_count_label.config(
+                text=str(total_online)
+            )
+
+            self.registered_count_label.config(
+                text=str(total_users)
+            )
+
+            self.sent_count_label.config(
+                text=str(total_sent)
+            )
+
+            self.decoded_count_label.config(
+                text=str(total_decoded)
+            )
 
         self.root.after(
             0,
@@ -432,17 +499,25 @@ class Server:
             return
 
         def update():
+            current_time = datetime.now().strftime(
+                "%H:%M:%S"
+            )
+
             self.log_text.config(
                 state=tk.NORMAL
             )
 
             self.log_text.insert(
                 tk.END,
-                text + "\n"
+                "[" + current_time + "] " + text + "\n"
             )
 
             self.log_text.config(
                 state=tk.DISABLED
+            )
+
+            self.log_text.see(
+                tk.END
             )
 
         self.root.after(
@@ -461,11 +536,7 @@ class Server:
 
         try:
             pygame.mixer.init()
-
-            pygame.mixer.music.load(
-                audio_path
-            )
-
+            pygame.mixer.music.load(audio_path)
             pygame.mixer.music.play()
 
         except Exception:
@@ -477,42 +548,56 @@ class Server:
         )
 
         splash.geometry(
-            "500x250"
+            "450x250"
+        )
+
+        splash.resizable(
+            False,
+            False
         )
 
         splash.configure(
-            bg="#111111"
+            bg="#20242b"
         )
 
         tk.Label(
             splash,
             text="MASKER",
-            font=("Arial", 30, "bold"),
+            font=("Arial", 28, "bold"),
             fg="white",
-            bg="#111111"
+            bg="#20242b"
         ).pack(
-            pady=(50, 10)
+            pady=(45, 10)
         )
 
         tk.Label(
             splash,
-            text="LIOR STAS",
-            font=("Arial", 17),
-            fg="white",
-            bg="#111111"
+            text="Lior Stas",
+            font=("Arial", 16),
+            fg="#dddddd",
+            bg="#20242b"
         ).pack()
 
         tk.Label(
             splash,
-            text="Version 2.0",
-            fg="white",
-            bg="#111111"
+            text="Cyber Security Project",
+            font=("Arial", 10),
+            fg="#aaaaaa",
+            bg="#20242b"
         ).pack(
             pady=5
         )
 
+        tk.Label(
+            splash,
+            text="Version 2.0",
+            font=("Arial", 9),
+            fg="#888888",
+            bg="#20242b"
+        ).pack()
+
         splash.after(
-            2500,
+            2200,
             splash.destroy
         )
 
@@ -526,15 +611,19 @@ class Server:
             "server_statistics.csv"
         )
 
-        clients = self.db.get_all_rows(
-            "clients"
-        )
+        (
+            users_data,
+            total_users,
+            total_online,
+            total_sent,
+            total_decoded
+        ) = self.get_all_statistics()
 
         with open(
             path,
             "w",
             newline="",
-            encoding="utf-8"
+            encoding="utf-8-sig"
         ) as file:
 
             writer = csv.writer(
@@ -543,25 +632,68 @@ class Server:
 
             writer.writerow(
                 [
-                    "username",
-                    "online",
-                    "sent files",
-                    "decoded files"
+                    "MASKER SERVER STATISTICS"
                 ]
             )
 
-            for client in clients:
+            writer.writerow(
+                [
+                    "Generated",
+                    datetime.now().strftime(
+                        "%d/%m/%Y %H:%M:%S"
+                    )
+                ]
+            )
+
+            writer.writerow([])
+
+            writer.writerow(
+                [
+                    "Username",
+                    "Status",
+                    "Files Sent",
+                    "Decoded Files",
+                    "Last Seen"
+                ]
+            )
+
+            for item in users_data:
+                if item["online"]:
+                    status = "Online"
+
+                elif item["last_seen"]:
+                    status = "Offline"
+
+                else:
+                    status = "Never logged in"
+
+                if item["last_seen"]:
+                    last_seen = str(
+                        item["last_seen"]
+                    )
+
+                else:
+                    last_seen = "Never logged in"
+
                 writer.writerow(
                     [
-                        client[1],
-                        client[6],
-                        client[7],
-                        client[8]
+                        item["username"],
+                        status,
+                        item["sent"],
+                        item["decoded"],
+                        last_seen
                     ]
                 )
 
+            writer.writerow([])
+            writer.writerow(["Summary"])
+            writer.writerow(["Registered Users", total_users])
+            writer.writerow(["Online Now", total_online])
+            writer.writerow(["Total Files Sent", total_sent])
+            writer.writerow(["Total Decoded", total_decoded])
+
         self.write_log(
-            "Statistics saved"
+            "Statistics exported"
         )
 
     def start_server(self):
@@ -600,6 +732,42 @@ class Server:
 
             thread.start()
 
+    def create_stat_box(
+        self,
+        parent,
+        title
+    ):
+        frame = tk.Frame(
+            parent,
+            bg="#2b3038",
+            bd=1,
+            relief="solid"
+        )
+
+        tk.Label(
+            frame,
+            text=title,
+            font=("Arial", 10),
+            fg="#bbbbbb",
+            bg="#2b3038"
+        ).pack(
+            pady=(8, 2)
+        )
+
+        value = tk.Label(
+            frame,
+            text="0",
+            font=("Arial", 18, "bold"),
+            fg="white",
+            bg="#2b3038"
+        )
+
+        value.pack(
+            pady=(0, 8)
+        )
+
+        return frame, value
+
     def create_gui(self):
         self.play_audio()
         self.show_splash()
@@ -611,68 +779,276 @@ class Server:
         )
 
         self.root.geometry(
-            "700x600"
+            "1000x700"
+        )
+
+        self.root.configure(
+            bg="#1d2127"
+        )
+
+        title_frame = tk.Frame(
+            self.root,
+            bg="#1d2127"
+        )
+
+        title_frame.pack(
+            fill="x",
+            padx=20,
+            pady=(18, 10)
         )
 
         tk.Label(
-            self.root,
-            text="Server Log",
-            font=("Arial", 14, "bold")
+            title_frame,
+            text="MASKER Server",
+            font=("Arial", 22, "bold"),
+            fg="white",
+            bg="#1d2127"
         ).pack(
-            pady=5
+            side="left"
+        )
+
+        tk.Label(
+            title_frame,
+            text="Server Running",
+            font=("Arial", 10),
+            fg="#62c47b",
+            bg="#1d2127"
+        ).pack(
+            side="right"
+        )
+
+        stats_frame = tk.Frame(
+            self.root,
+            bg="#1d2127"
+        )
+
+        stats_frame.pack(
+            fill="x",
+            padx=20,
+            pady=(0, 10)
+        )
+
+        stats_frame.grid_columnconfigure(
+            0,
+            weight=1
+        )
+
+        stats_frame.grid_columnconfigure(
+            1,
+            weight=1
+        )
+
+        stats_frame.grid_columnconfigure(
+            2,
+            weight=1
+        )
+
+        stats_frame.grid_columnconfigure(
+            3,
+            weight=1
+        )
+
+        box, self.online_count_label = self.create_stat_box(
+            stats_frame,
+            "Online"
+        )
+
+        box.grid(
+            row=0,
+            column=0,
+            sticky="nsew",
+            padx=5
+        )
+
+        box, self.registered_count_label = self.create_stat_box(
+            stats_frame,
+            "Registered"
+        )
+
+        box.grid(
+            row=0,
+            column=1,
+            sticky="nsew",
+            padx=5
+        )
+
+        box, self.sent_count_label = self.create_stat_box(
+            stats_frame,
+            "Files Sent"
+        )
+
+        box.grid(
+            row=0,
+            column=2,
+            sticky="nsew",
+            padx=5
+        )
+
+        box, self.decoded_count_label = self.create_stat_box(
+            stats_frame,
+            "Decoded"
+        )
+
+        box.grid(
+            row=0,
+            column=3,
+            sticky="nsew",
+            padx=5
+        )
+
+        log_frame = tk.Frame(
+            self.root,
+            bg="#2b3038"
+        )
+
+        log_frame.pack(
+            fill="both",
+            padx=20,
+            pady=8
+        )
+
+        tk.Label(
+            log_frame,
+            text="Server Log",
+            font=("Arial", 13, "bold"),
+            fg="white",
+            bg="#2b3038"
+        ).pack(
+            anchor="w",
+            padx=10,
+            pady=(10, 5)
         )
 
         self.log_text = scrolledtext.ScrolledText(
-            self.root,
+            log_frame,
             height=10,
+            bg="#181b20",
+            fg="white",
+            font=("Consolas", 10),
             state=tk.DISABLED
         )
 
         self.log_text.pack(
-            fill="x",
-            padx=15
+            fill="both",
+            expand=True,
+            padx=10,
+            pady=(0, 10)
+        )
+
+        clients_frame = tk.Frame(
+            self.root,
+            bg="#1d2127"
+        )
+
+        clients_frame.pack(
+            fill="both",
+            expand=True,
+            padx=20,
+            pady=8
+        )
+
+        online_frame = tk.Frame(
+            clients_frame,
+            bg="#2b3038"
+        )
+
+        online_frame.pack(
+            side="left",
+            fill="both",
+            expand=True,
+            padx=(0, 5)
         )
 
         tk.Label(
-            self.root,
-            text="Connected Now"
+            online_frame,
+            text="Connected Now",
+            font=("Arial", 12, "bold"),
+            fg="white",
+            bg="#2b3038"
         ).pack(
-            pady=(10, 2)
+            pady=8
         )
 
         self.online_list = tk.Listbox(
-            self.root,
-            height=7
+            online_frame,
+            bg="#181b20",
+            fg="white",
+            font=("Consolas", 10)
         )
 
         self.online_list.pack(
-            fill="x",
-            padx=15
+            fill="both",
+            expand=True,
+            padx=10,
+            pady=(0, 10)
+        )
+
+        all_frame = tk.Frame(
+            clients_frame,
+            bg="#2b3038"
+        )
+
+        all_frame.pack(
+            side="right",
+            fill="both",
+            expand=True,
+            padx=(5, 0)
         )
 
         tk.Label(
-            self.root,
-            text="All Clients"
+            all_frame,
+            text="All Clients",
+            font=("Arial", 12, "bold"),
+            fg="white",
+            bg="#2b3038"
         ).pack(
-            pady=(10, 2)
+            pady=8
         )
 
         self.all_list = tk.Listbox(
-            self.root,
-            height=8
+            all_frame,
+            bg="#181b20",
+            fg="white",
+            font=("Consolas", 10)
         )
 
         self.all_list.pack(
-            fill="x",
-            padx=15
+            fill="both",
+            expand=True,
+            padx=10,
+            pady=(0, 10)
         )
 
-        tk.Button(
+        bottom_frame = tk.Frame(
             self.root,
-            text="Export Statistics",
-            command=self.export_statistics
+            bg="#1d2127"
+        )
+
+        bottom_frame.pack(
+            fill="x",
+            padx=20,
+            pady=(5, 15)
+        )
+
+        tk.Label(
+            bottom_frame,
+            text="Lior Stas | Version 2.0",
+            font=("Arial", 9),
+            fg="#999999",
+            bg="#1d2127"
         ).pack(
-            pady=10
+            side="left"
+        )
+
+        
+        tk.Button(
+            bottom_frame,
+            text="Export Statistics",
+            command=self.export_statistics,
+            width=18
+        ).pack(
+            side="right",
+            padx=5
         )
 
         self.refresh_lists()
