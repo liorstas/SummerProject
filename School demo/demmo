@@ -1,0 +1,248 @@
+import argparse
+import json
+import math
+import time
+import urllib.request
+from pathlib import Path
+
+import cv2
+import mediapipe as mp
+import numpy as np
+
+
+MODEL_PATH = Path(__file__).with_name("pose_landmarker_lite.task")
+MODEL_URL = (
+    "https://storage.googleapis.com/mediapipe-models/pose_landmarker/"
+    "pose_landmarker_lite/float16/latest/pose_landmarker_lite.task"
+)
+EXTENDED_ANGLE = 155
+FLEXED_ANGLE = 60
+STABLE_FRAMES = 3
+MIN_VISIBILITY = 0.65
+
+
+def elbow_angle(shoulder, elbow, wrist):
+    first = np.array(shoulder, dtype=float) - np.array(elbow, dtype=float)
+    second = np.array(wrist, dtype=float) - np.array(elbow, dtype=float)
+    denominator = np.linalg.norm(first) * np.linalg.norm(second)
+    if denominator < 1e-6:
+        return None
+    cosine = np.clip(np.dot(first, second) / denominator, -1.0, 1.0)
+    return math.degrees(math.acos(cosine))
+
+
+class CurlCounter:
+    def __init__(self):
+        self.reps = 0
+        self.durations = []
+        self.reset_tracking()
+
+    def reset_tracking(self):
+        self.angle = None
+        self.stage = "START WITH ARM STRAIGHT"
+        self.extended_frames = 0
+        self.flexed_frames = 0
+        self.start_time = None
+
+    def update(self, angle, timestamp):
+        if angle is None:
+            self.reset_tracking()
+            return False
+
+        self.angle = angle if self.angle is None else 0.4 * angle + 0.6 * self.angle
+        self.extended_frames = self.extended_frames + 1 if self.angle >= EXTENDED_ANGLE else 0
+        self.flexed_frames = self.flexed_frames + 1 if self.angle <= FLEXED_ANGLE else 0
+
+        if self.stage == "START WITH ARM STRAIGHT":
+            if self.extended_frames >= STABLE_FRAMES:
+                self.stage = "READY - CURL UP"
+        elif self.stage == "READY - CURL UP":
+            if self.angle < EXTENDED_ANGLE - 10 and self.start_time is None:
+                self.start_time = timestamp
+            if self.flexed_frames >= STABLE_FRAMES:
+                self.stage = "LOWER YOUR ARM"
+            elif self.extended_frames >= STABLE_FRAMES:
+                self.start_time = None
+        elif self.stage == "LOWER YOUR ARM":
+            if self.extended_frames >= STABLE_FRAMES:
+                duration = timestamp - self.start_time if self.start_time is not None else 0
+                self.stage = "READY - CURL UP"
+                self.start_time = None
+                if duration >= 0.4:
+                    self.reps += 1
+                    self.durations.append(round(duration, 2))
+                    return True
+        return False
+
+
+def draw_result(frame, points, counter, arm, tracking, source_is_camera):
+    if points is not None:
+        pixels = [(int(x), int(y)) for x, y in points]
+        cv2.line(frame, pixels[0], pixels[1], (80, 230, 150), 5, cv2.LINE_AA)
+        cv2.line(frame, pixels[1], pixels[2], (80, 230, 150), 5, cv2.LINE_AA)
+        for point in pixels:
+            cv2.circle(frame, point, 8, (255, 255, 255), -1, cv2.LINE_AA)
+            cv2.circle(frame, point, 5, (80, 230, 150), -1, cv2.LINE_AA)
+        angle_label = f"{counter.angle:.0f} deg"
+        text_width = cv2.getTextSize(angle_label, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)[0][0]
+        text_x = max(6, min(pixels[1][0] + 12, frame.shape[1] - text_width - 6))
+        text_y = max(24, pixels[1][1] - 12)
+        cv2.putText(frame, angle_label, (text_x, text_y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
+
+    height, width = frame.shape[:2]
+    panel = np.full((height, 340, 3), (30, 25, 22), dtype=np.uint8)
+
+    def label(text, y, scale=0.65, color=(220, 220, 220), thickness=1):
+        cv2.putText(panel, text, (24, y), cv2.FONT_HERSHEY_SIMPLEX,
+                    scale, color, thickness, cv2.LINE_AA)
+
+    label("FITNESS PROTOTYPE", 42, 0.8, (80, 230, 150), 2)
+    label(f"BICEP CURL / {arm.upper()} ARM", 77, 0.55)
+    label("COMPLETED REPS", 130, 0.6)
+    label(str(counter.reps), 215, 2.7, (255, 255, 255), 3)
+    angle_text = f"{counter.angle:.0f} deg" if counter.angle is not None else "--"
+    label(f"Elbow angle: {angle_text}", 260)
+    last_rep = f"{counter.durations[-1]:.2f} s" if counter.durations else "--"
+    label(f"Last rep: {last_rep}", 298)
+    label("TRACKING" if tracking else "ARM NOT VISIBLE", 343, 0.65,
+          (80, 230, 150) if tracking else (80, 180, 255), 2)
+    label(counter.stage if tracking else "SHOW SHOULDER, ELBOW, WRIST", 378, 0.48)
+    label("Straight -> bent -> straight", 425, 0.5)
+    label("Q: quit  R: reset  S: save", 470, 0.5)
+    label("CAMERA INPUT" if source_is_camera else "RECORDED VIDEO INPUT", 511, 0.5)
+    return np.hstack((frame, panel))
+
+
+def save_image(path, image):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    success, encoded = cv2.imencode(path.suffix or ".png", image)
+    if not success:
+        raise RuntimeError("Could not encode the result image.")
+    encoded.tofile(str(path))
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Count bicep curls from a webcam or a video.")
+    parser.add_argument("--source", default="0", help="Camera number or video file path.")
+    parser.add_argument("--arm", choices=["left", "right"], default="left")
+    parser.add_argument("--headless", action="store_true", help="Process a video without opening a window.")
+    parser.add_argument("--snapshot", default="result.png", help="Where to save the result image.")
+    parser.add_argument("--summary", default="workout_result.json", help="Where to save the workout result.")
+    args = parser.parse_args()
+    source_is_camera = args.source.isdecimal()
+    if args.headless and source_is_camera:
+        parser.error("Use a video file with --headless.")
+
+    if not MODEL_PATH.exists():
+        print("Downloading the pose model once...")
+        temporary_path = MODEL_PATH.with_suffix(".download")
+        try:
+            with urllib.request.urlopen(MODEL_URL, timeout=60) as response:
+                temporary_path.write_bytes(response.read())
+            temporary_path.replace(MODEL_PATH)
+        except Exception as error:
+            temporary_path.unlink(missing_ok=True)
+            raise RuntimeError("Model download failed. Extract the full ZIP, including the .task file.") from error
+
+    source = int(args.source) if source_is_camera else args.source
+    capture = cv2.VideoCapture(source)
+    if not capture.isOpened():
+        raise RuntimeError("Could not open the camera/video. Check permissions or try --source 1.")
+
+    fps = capture.get(cv2.CAP_PROP_FPS)
+    if not math.isfinite(fps) or fps <= 0:
+        fps = 30
+    options = mp.tasks.vision.PoseLandmarkerOptions(
+        base_options=mp.tasks.BaseOptions(model_asset_path=str(MODEL_PATH)),
+        running_mode=mp.tasks.vision.RunningMode.VIDEO,
+        num_poses=1,
+        min_pose_detection_confidence=0.5,
+        min_pose_presence_confidence=0.5,
+        min_tracking_confidence=0.5,
+    )
+    indices = (11, 13, 15) if args.arm == "left" else (12, 14, 16)
+    counter = CurlCounter()
+    frame_number = 0
+    tracked_frames = 0
+    start = time.monotonic()
+    last_timestamp_ms = -1
+    last_result = None
+    last_tracked_result = None
+
+    try:
+        with mp.tasks.vision.PoseLandmarker.create_from_options(options) as detector:
+            while True:
+                success, frame = capture.read()
+                if not success:
+                    break
+                height, width = frame.shape[:2]
+                frame = cv2.resize(frame, (int(width * 540 / height), 540))
+                height, width = frame.shape[:2]
+                timestamp = time.monotonic() - start if source_is_camera else frame_number / fps
+                timestamp_ms = max(last_timestamp_ms + 1, int(timestamp * 1000))
+                last_timestamp_ms = timestamp_ms
+                rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                image = mp.Image(image_format=mp.ImageFormat.SRGB, data=np.ascontiguousarray(rgb_frame))
+                result = detector.detect_for_video(image, timestamp_ms)
+                points = None
+                tracking = False
+                angle = None
+                if result.pose_landmarks:
+                    landmarks = [result.pose_landmarks[0][index] for index in indices]
+                    if all(point.visibility >= MIN_VISIBILITY and point.presence >= MIN_VISIBILITY
+                           and 0 <= point.x <= 1 and 0 <= point.y <= 1 for point in landmarks):
+                        points = [(point.x * width, point.y * height) for point in landmarks]
+                        angle = elbow_angle(*points)
+                        tracking = angle is not None
+                counted = counter.update(angle, timestamp)
+                if tracking:
+                    tracked_frames += 1
+                if counted:
+                    print(f"Rep {counter.reps}: {counter.durations[-1]:.2f} seconds")
+                last_result = draw_result(frame, points if tracking else None, counter,
+                                          args.arm, tracking, source_is_camera)
+                if tracking:
+                    last_tracked_result = last_result.copy()
+                frame_number += 1
+
+                if not args.headless:
+                    cv2.imshow("Fitness prototype", last_result)
+                    key = cv2.waitKey(1 if source_is_camera else max(1, round(1000 / fps))) & 0xFF
+                    if key == ord("q") or key == 27:
+                        break
+                    if key == ord("r"):
+                        counter = CurlCounter()
+                        last_tracked_result = None
+                    if key == ord("s"):
+                        save_image(args.snapshot, last_result)
+                        print(f"Image saved: {args.snapshot}")
+                    if cv2.getWindowProperty("Fitness prototype", cv2.WND_PROP_VISIBLE) < 1:
+                        break
+    finally:
+        capture.release()
+        if not args.headless:
+            cv2.destroyAllWindows()
+
+    if last_result is None:
+        raise RuntimeError("The source opened but no video frames could be read.")
+    save_image(args.snapshot, last_tracked_result if last_tracked_result is not None else last_result)
+    summary = {
+        "exercise": "bicep_curl",
+        "arm": args.arm,
+        "source": "camera" if source_is_camera else Path(args.source).name,
+        "completed_reps": counter.reps,
+        "rep_durations_seconds": counter.durations,
+        "processed_frames": frame_number,
+        "tracked_frames": tracked_frames,
+    }
+    summary_path = Path(args.summary)
+    summary_path.parent.mkdir(parents=True, exist_ok=True)
+    summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    print(json.dumps(summary, indent=2))
+    print(f"Result image: {args.snapshot}")
+
+
+if __name__ == "__main__":
+    main()

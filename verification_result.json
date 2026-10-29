@@ -1,0 +1,11 @@
+{
+  "exercise": "bicep_curl",
+  "arm": "left",
+  "source": "demo_input.mp4",
+  "completed_reps": 1,
+  "rep_durations_seconds": [
+    2.04
+  ],
+  "processed_frames": 240,
+  "tracked_frames": 239
+}

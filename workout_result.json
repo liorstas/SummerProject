@@ -1,0 +1,24 @@
+{
+  "exercise": "bicep_curl",
+  "arm": "left",
+  "source": "camera",
+  "completed_reps": 14,
+  "rep_durations_seconds": [
+    1.3,
+    1.14,
+    1.02,
+    2.5,
+    1.32,
+    1.48,
+    1.15,
+    0.49,
+    0.54,
+    0.52,
+    0.49,
+    0.53,
+    0.51,
+    0.45
+  ],
+  "processed_frames": 2374,
+  "tracked_frames": 1276
+}
